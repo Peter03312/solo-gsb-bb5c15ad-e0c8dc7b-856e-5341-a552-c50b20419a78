@@ -33,6 +33,15 @@
  *    不递增台账版本，已发放凭据不受影响；同号同目标重试幂等返回原封存，同号异目标 409，
  *    目标不存在或取证失败不占号；封存内容永不随后续分装 / 更正 / 隔离变动改写，
  *    比较时用与封存相同的构建器从当前台账重算并逐项对照（未变化项不列出）。
+ *  - 样本有效期：登记原始瓶时可填写失效时间，已登记原瓶可修改或清除；
+ *    衍生瓶的失效时间按其全部来源瓶（递归至原瓶）中最早的有效失效时间自动继承，
+ *    全部来源均无失效时间则不设，历史更正后随当前形成图自动重算。
+ *    当前时间到达失效时间的瓶为已失效；失效瓶及其下游瓶（失效时间沿来源链继承，
+ *    必然同样失效）不得用于新分装 / 混样、预约登记或预约核销（单条提交、批次预演
+ *    与提交、预约登记与携预约执行均拦截，批次整批回滚不落库）。
+ *    历史操作、更正、证据封存与查询不受影响；失效时间变动递增台账版本，
+ *    凭据另绑定已失效瓶集合指纹（瓶到达失效时间即使无写操作也使未提交凭据失效）；
+ *    幂等判定先于失效拦截，已成功请求的幂等重试保持原结果。
  *  - better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
  *    并发请求争用同一来源瓶时天然保证体积守恒。
  */
@@ -133,6 +142,12 @@ const opCols = db.prepare('PRAGMA table_info(operations)').all().map((c) => c.na
 if (!opCols.includes('reservation_id')) {
   db.exec('ALTER TABLE operations ADD COLUMN reservation_id TEXT');
 }
+// 迁移：既有数据库的 bottles 表补充 expires_at 列（样本失效时间；仅原瓶直接设置，
+// 衍生瓶不存储，按其全部来源瓶中最早的有效失效时间沿形成图实时继承计算）
+const bottleCols = db.prepare('PRAGMA table_info(bottles)').all().map((c) => c.name);
+if (!bottleCols.includes('expires_at')) {
+  db.exec('ALTER TABLE bottles ADD COLUMN expires_at TEXT');
+}
 db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('ledger_version', '0')").run();
 
 // ---------------------------------------------------------------- 工具与校验
@@ -193,7 +208,8 @@ function parseSources(raw) {
 // ---------------------------------------------------------------- 预编译语句
 
 const qBottle     = db.prepare('SELECT * FROM bottles WHERE id = ?');
-const qInsBottle  = db.prepare('INSERT INTO bottles (id, kind, created_time, initial_volume, created_op) VALUES (?, ?, ?, ?, ?)');
+const qInsBottle  = db.prepare('INSERT INTO bottles (id, kind, created_time, initial_volume, created_op, expires_at) VALUES (?, ?, ?, ?, ?, ?)');
+const qExpUpd     = db.prepare('UPDATE bottles SET expires_at = ? WHERE id = ?');
 const qOp         = db.prepare('SELECT * FROM operations WHERE op_id = ?');
 const qInsOp      = db.prepare('INSERT INTO operations (op_id, seq, target_bottle, op_time, reservation_id) VALUES (?, ?, ?, ?, ?)');
 const qNextSeq    = db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM operations');
@@ -344,6 +360,78 @@ function quarantineBlockIfAffected(sources) {
     blocked);
 }
 
+// ---------------------------------------------------------------- 样本有效期
+
+/**
+ * 失效时间索引（基于当前已提交形成图实时重建）：
+ *  - 原瓶：取登记时填写、可修改 / 清除的 expires_at（未设置为 null）；
+ *  - 衍生瓶：按其全部来源瓶中最早的有效失效时间自动计算（沿来源链递归至原瓶，
+ *    即全部原始祖先中已设失效时间者的最早值）；全部来源均无失效时间则不设（null）。
+ * 历史更正成功后形成图变化，本索引在查询 / 校验时重建，衍生瓶失效时间随之自动重算；
+ * 被守恒规则拒绝的更正已回滚，形成图不变，失效时间维持原状态。
+ * 返回 Map<瓶编号, 失效时间字符串|null>（时间格式与操作时间一致，字典序即时间序）。
+ */
+function expiryMap() {
+  const rows = db.prepare('SELECT id, kind, expires_at FROM bottles').all();
+  const info = new Map(rows.map((r) => [r.id, r]));
+  const { derivedMap } = loadCompositionMaps();
+  const memo = new Map();
+  const compute = (id, stack) => {
+    if (memo.has(id)) return memo.get(id);
+    const b = info.get(id);
+    if (!b || b.kind === 'original') {
+      const v = b && b.expires_at ? b.expires_at : null;
+      memo.set(id, v);
+      return v;
+    }
+    if (stack.includes(id)) { memo.set(id, null); return null; } // 防御：循环引用按无失效时间处理
+    stack.push(id);
+    let best = null;
+    const spec = derivedMap.get(id);
+    if (spec) {
+      for (const s of spec.sources) {
+        const e = compute(s.bottle, stack);
+        if (e !== null && (best === null || e < best)) best = e;
+      }
+    }
+    stack.pop();
+    memo.set(id, best);
+    return best;
+  };
+  for (const r of rows) compute(r.id, []);
+  return memo;
+}
+
+/**
+ * 当前已失效的瓶编号列表（失效时间不为空且不晚于当前时刻；字典序即时间序）。
+ * 衍生瓶的失效时间继承自来源链，故失效瓶的全部下游瓶必然同样失效
+ * （其继承失效时间不晚于失效祖先的失效时间），拦截失效瓶即拦截其下游瓶。
+ */
+function expiredBottleIds(now) {
+  const out = [];
+  for (const [id, e] of expiryMap()) {
+    if (e !== null && e <= now) out.push(id);
+  }
+  return out.sort();
+}
+
+/**
+ * 校验一批来源瓶是否已失效（单条操作提交 / 预约登记用；携预约执行时来源即预约来源，
+ * 同一拦截即阻止预约核销）。全部可用时返回 null；否则返回 409 ApiError，
+ * details 逐瓶给出失效时间。
+ */
+function expiryBlockIfExpired(sources) {
+  const now = nowLocal();
+  const expMap = expiryMap();
+  const blocked = sources
+    .map((s) => ({ bottle: s.bottle, expires_at: expMap.get(s.bottle) ?? null }))
+    .filter((x) => x.expires_at !== null && x.expires_at <= now);
+  if (!blocked.length) return null;
+  return new ApiError(409, 'EXPIRED_SOURCE',
+    `以下来源瓶已失效，失效瓶及其下游瓶不得用于新分装 / 混样、预约登记或预约核销：${blocked.map((b) => `${b.bottle}（失效时间 ${b.expires_at}）`).join('；')}`,
+    blocked);
+}
+
 // ---------------------------------------------------------------- 预约锁定
 
 /**
@@ -366,12 +454,16 @@ function activeReservedByBottle(now) {
 }
 
 /**
- * 预约指纹：当前有效预约号集合的 SHA-256。预约新增 / 取消 / 核销 / 到期都会改变该集合，
- * 批次提交凭据与更正确认凭据绑定签发时的指纹，指纹变化即未提交预演凭据失效。
+ * 状态指纹：当前有效预约号集合 + 当前已失效瓶集合 的 SHA-256。
+ * 预约新增 / 取消 / 核销 / 到期，或瓶到达失效时间（含失效时间被设置 / 修改 / 清除）
+ * 都会改变该指纹；批次提交凭据与更正确认凭据绑定签发时的指纹，
+ * 指纹变化即未提交的预演凭据失效；已成功请求的幂等结果不受影响。
  */
-function reservationFingerprint() {
-  const ids = qResActiveIds.all(nowLocal()).map((r) => r.reservation_id);
-  return crypto.createHash('sha256').update(ids.join(',')).digest('hex');
+function stateFingerprint() {
+  const now = nowLocal();
+  const ids = qResActiveIds.all(now).map((r) => r.reservation_id);
+  const expired = expiredBottleIds(now);
+  return crypto.createHash('sha256').update(ids.join(',') + '|exp:' + expired.join(',')).digest('hex');
 }
 
 /** 预约记录行 → API JSON（状态为实时判定的有效态）。 */
@@ -503,6 +595,8 @@ const createOperation = db.transaction((p) => {
   }
   const quarBlock = quarantineBlockIfAffected(p.sources);
   if (quarBlock) throw quarBlock; // 受隔离影响的瓶不得兑现预约（预约来源即操作来源），也不得新取用
+  const expBlock = expiryBlockIfExpired(p.sources);
+  if (expBlock) throw expBlock; // 失效瓶及其下游瓶不得用于新分装 / 混样；携预约执行时同一拦截即阻止预约核销
 
   let reservation = null;
   if (p.reservation_id) {
@@ -519,7 +613,7 @@ const createOperation = db.transaction((p) => {
   }
 
   qInsOp.run(p.op_id, qNextSeq.get().next, p.target, p.op_time, p.reservation_id || null);
-  qInsBottle.run(p.target, 'derived', p.op_time, 0, p.op_id);
+  qInsBottle.run(p.target, 'derived', p.op_time, 0, p.op_id, null);
   for (const s of p.sources) qInsSource.run(p.op_id, s.bottle, s.volume);
   if (reservation) fulfillReservation(p.reservation_id, p.op_id); // 与取用原子核销；失败整体回滚不核销
 
@@ -606,6 +700,45 @@ const liftQuarantine = db.transaction((id) => {
            message: `原瓶 ${id} 已解除隔离；仍命中其他隔离原瓶的瓶保持受影响，影响范围已按当前来源关系重算` };
 });
 
+/**
+ * 设置 / 修改原瓶失效时间（事务）：仅已登记原始瓶；衍生瓶的失效时间按全部来源瓶中
+ * 最早者自动继承，不可直接设置。相同失效时间重复设置 → 幂等返回（台账版本不变，
+ * 已发放凭据不受影响）；新设或修改 → 台账版本递增，未使用的批次提交凭据与
+ * 更正确认凭据随之失效（凭据另绑定已失效瓶集合指纹，瓶到达失效时间亦使凭据失效）。
+ */
+const setExpiry = db.transaction((id, expiresAt) => {
+  const b = qBottle.get(id);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${id} 不存在`);
+  if (b.kind !== 'original') {
+    throw new ApiError(400, 'NOT_ORIGINAL',
+      `仅已登记原始瓶可设置失效时间，${id} 为衍生瓶（其失效时间按全部来源瓶中最早者自动继承，不可直接设置）`);
+  }
+  if (b.expires_at === expiresAt) {
+    return { ok: true, idempotent: true, bottle: id, expires_at: expiresAt,
+             message: `原瓶 ${id} 的失效时间已是 ${expiresAt}，幂等返回，未重复变更` };
+  }
+  const had = !!b.expires_at;
+  qExpUpd.run(expiresAt, id);
+  qBumpVersion.run();
+  return { ok: true, idempotent: false, updated: had, bottle: id, expires_at: expiresAt,
+           message: `原瓶 ${id} 的失效时间已${had ? '更新' : '设置'}为 ${expiresAt}；其下游衍生瓶的失效时间已按来源链自动重算，未使用的预演 / 确认凭据已失效` };
+});
+
+/** 清除原瓶失效时间（事务）。状态变动使台账版本递增，未使用凭据失效。 */
+const clearExpiry = db.transaction((id) => {
+  const b = qBottle.get(id);
+  if (!b) throw new ApiError(404, 'BOTTLE_NOT_FOUND', `瓶 ${id} 不存在`);
+  if (b.kind !== 'original') {
+    throw new ApiError(400, 'NOT_ORIGINAL',
+      `仅已登记原始瓶可清除失效时间，${id} 为衍生瓶（其失效时间按全部来源瓶中最早者自动继承，不可直接清除）`);
+  }
+  if (!b.expires_at) throw new ApiError(409, 'NO_EXPIRY', `原瓶 ${id} 未设置失效时间，无需清除`);
+  qExpUpd.run(null, id);
+  qBumpVersion.run();
+  return { ok: true, bottle: id, expires_at: null,
+           message: `原瓶 ${id} 的失效时间已清除；其下游衍生瓶的失效时间已按来源链自动重算，未使用的预演 / 确认凭据已失效` };
+});
+
 // ---------------------------------------------------------------- 预约业务事务
 
 /**
@@ -637,6 +770,8 @@ const createReservation = db.transaction((id, expiresAt, sources) => {
   }
   const quarBlock = quarantineBlockIfAffected(sources);
   if (quarBlock) throw quarBlock; // 受隔离影响的瓶不得新预约
+  const expBlock = expiryBlockIfExpired(sources);
+  if (expBlock) throw expBlock; // 已失效的瓶（及其下游瓶）不得新预约
   const { balances } = recompute();
   const reserved = activeReservedByBottle(now);
   const bad = [];
@@ -729,11 +864,14 @@ function normalizeBatchItems(rawItems) {
 /**
  * 批次业务校验（预演与提交共用，提交时在事务内重跑）：
  * 编号冲突（批内 / 现有台账）、来源存在性（可引用批内前项生成的瓶）、
- * 操作时间不得早于来源创建时间、来源瓶不得受隔离影响、
+ * 操作时间不得早于来源创建时间、来源瓶不得受隔离影响、来源瓶不得已失效、
  * 携预约条目的预约须当前有效且来源及用量逐项吻合（同一预约批内只能核销一次）、
  * 未携预约条目的取用合计不得超过各瓶未锁定余量。
  * 隔离影响沿批内传播：前项条目命中隔离来源时，其目标瓶视为受影响，
- * 后续引用该瓶的条目一并拦截（提交时整批回滚，不落库）。返回 Map(index -> errors)。
+ * 后续引用该瓶的条目一并拦截（提交时整批回滚，不落库）。
+ * 失效时间同样沿批内传播：批内条目生成的目标瓶按全部来源中最早的有效失效时间继承，
+ * 前项使用已失效来源时其目标瓶同样已失效，后续引用该瓶的条目一并拦截。
+ * 返回 Map(index -> errors)。
  */
 function validateBatchItems(items) {
   const errMap = new Map();
@@ -751,6 +889,8 @@ function validateBatchItems(items) {
   });
   const quarImpact = quarantineImpactMap(); // 当前台账中受隔离影响的瓶（含隔离原瓶自身）
   const batchHit = new Map();               // 批内受影响目标瓶 -> 使其受影响的条目下标
+  const expMap = expiryMap();               // 当前台账各瓶的失效时间（衍生瓶按来源链继承最早者）
+  const batchExpiry = new Map();            // 批内目标瓶 -> 继承的失效时间（全部来源无失效时间则为 null）
   const now = nowLocal();
   items.forEach((it, i) => {
     if (!it.op_id || !it.target || !it.op_time || it.sources.length === 0) return; // 格式错误已记录
@@ -784,6 +924,7 @@ function validateBatchItems(items) {
       }
     }
     let itemHit = false; // 本条目是否命中隔离（命中则其目标瓶在批内视为受影响，向后传播）
+    const srcExps = [];  // 本条目各来源的有效失效时间（目标瓶继承其中最早者，供批内后项判定）
     for (const s of it.sources) {
       const b = qBottle.get(s.bottle);
       if (b) {
@@ -794,6 +935,14 @@ function validateBatchItems(items) {
           pushErr(i, 'QUARANTINED_SOURCE',
             `第 ${n} 条：来源瓶 ${s.bottle} 受隔离影响（命中隔离原瓶 ${hitsText(quarImpact.get(s.bottle))}），不得用于新分装 / 混样`);
           itemHit = true;
+        }
+        const e = expMap.get(s.bottle) ?? null;
+        if (e !== null) {
+          srcExps.push(e);
+          if (e <= now) {
+            pushErr(i, 'EXPIRED_SOURCE',
+              `第 ${n} 条：来源瓶 ${s.bottle} 已失效（失效时间 ${e}），失效瓶及其下游瓶不得用于新分装 / 混样、预约登记或预约核销`);
+          }
         }
         continue;
       }
@@ -811,9 +960,19 @@ function validateBatchItems(items) {
             `第 ${n} 条：来源瓶 ${s.bottle} 由本批第 ${batchHit.get(s.bottle) + 1} 条生成，该前项受隔离影响，本条目一并拦截`);
           itemHit = true;
         }
+        const e = batchExpiry.get(s.bottle) ?? null;
+        if (e !== null) {
+          srcExps.push(e);
+          if (e <= now) {
+            pushErr(i, 'EXPIRED_SOURCE',
+              `第 ${n} 条：来源瓶 ${s.bottle} 由本批第 ${j + 1} 条生成，其继承的失效时间 ${e} 已到，失效瓶及其下游瓶不得用于新分装 / 混样、预约登记或预约核销`);
+          }
+        }
       }
     }
     if (itemHit) batchHit.set(it.target, i);
+    // 目标瓶按全部来源瓶中最早的有效失效时间继承（全部来源无失效时间则不设），供批内后续条目判定
+    batchExpiry.set(it.target, srcExps.length ? srcExps.reduce((a, b) => (a < b ? a : b)) : null);
   });
   // 未携预约条目的取用只能动用未锁定余量：按瓶汇总批内未携预约取用，
   // 不得超过 当前余量 − 有效预约锁定量（携预约条目的取用由其预约锁定量覆盖，
@@ -894,10 +1053,11 @@ function planHashOf(batchId, items) {
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
-/** 提交凭据：绑定 计划哈希 + 当前台账版本 + 预约指纹，HMAC 签名防篡改。
- *  预演后台账变化或预约状态变化（新增 / 取消 / 核销 / 到期）均使凭据失效。 */
+/** 提交凭据：绑定 计划哈希 + 当前台账版本 + 状态指纹（有效预约集合 + 已失效瓶集合），HMAC 签名防篡改。
+ *  预演后台账变化、预约状态变化（新增 / 取消 / 核销 / 到期）或瓶失效状态变化
+ * （到达失效时间、失效时间被设置 / 修改 / 清除）均使凭据失效。 */
 function signCommitToken(version, planHash) {
-  const fp = reservationFingerprint();
+  const fp = stateFingerprint();
   const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`v1.${version}.${fp}.${planHash}`).digest('hex');
   return `v1.${version}.${fp}.${planHash}.${mac}`;
 }
@@ -922,8 +1082,8 @@ function verifyCommitToken(token, planHash) {
   if (parseInt(ver, 10) !== ledgerVersion()) {
     throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
   }
-  if (fp !== reservationFingerprint()) {
-    throw new ApiError(409, 'STALE_TOKEN', '预演后预约状态已变化（新增 / 取消 / 核销 / 到期），预演结果已失效，请重新预演');
+  if (fp !== stateFingerprint()) {
+    throw new ApiError(409, 'STALE_TOKEN', '预演后预约状态或瓶失效状态已变化（预约新增 / 取消 / 核销 / 到期，或瓶到达失效时间、失效时间被设置 / 修改 / 清除），预演结果已失效，请重新预演');
   }
 }
 
@@ -955,7 +1115,7 @@ const commitBatch = db.transaction((batchId, items, planHash, token) => {
   qInsBatch.run(batchId, planHash, items.length, new Date().toISOString());
   items.forEach((it, i) => {
     qInsOp.run(it.op_id, qNextSeq.get().next, it.target, it.op_time, it.reservation_id || null);
-    qInsBottle.run(it.target, 'derived', it.op_time, 0, it.op_id);
+    qInsBottle.run(it.target, 'derived', it.op_time, 0, it.op_id, null);
     for (const s of it.sources) qInsSource.run(it.op_id, s.bottle, s.volume);
     qInsBatchItem.run(batchId, i, it.op_id);
     if (it.reservation_id) fulfillReservation(it.reservation_id, it.op_id); // 与取用原子核销；失败整批回滚不核销
@@ -1153,9 +1313,10 @@ function correctionPlanHash(opId, sources) {
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
-/** 更正确认凭据：绑定 更正计划哈希 + 当前台账版本 + 预约指纹，HMAC 签名防篡改（域前缀 c1 与批次凭据 v1 隔离）。 */
+/** 更正确认凭据：绑定 更正计划哈希 + 当前台账版本 + 状态指纹（有效预约集合 + 已失效瓶集合），
+ *  HMAC 签名防篡改（域前缀 c1 与批次凭据 v1 隔离）。 */
 function signCorrectionToken(version, planHash) {
-  const fp = reservationFingerprint();
+  const fp = stateFingerprint();
   const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${version}.${fp}.${planHash}`).digest('hex');
   return `c1.${version}.${fp}.${planHash}.${mac}`;
 }
@@ -1180,8 +1341,8 @@ function verifyCorrectionToken(token, planHash) {
   if (parseInt(ver, 10) !== ledgerVersion()) {
     throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
   }
-  if (fp !== reservationFingerprint()) {
-    throw new ApiError(409, 'STALE_TOKEN', '预演后预约状态已变化（新增 / 取消 / 核销 / 到期），预演结果已失效，请重新预演');
+  if (fp !== stateFingerprint()) {
+    throw new ApiError(409, 'STALE_TOKEN', '预演后预约状态或瓶失效状态已变化（预约新增 / 取消 / 核销 / 到期，或瓶到达失效时间、失效时间被设置 / 修改 / 清除），预演结果已失效，请重新预演');
   }
 }
 
@@ -1562,19 +1723,23 @@ const wrap = (fn) => (req, res) => {
   }
 };
 
-/** 登记原始瓶（事务）：提交后台账版本递增，已发放的批次凭据随之失效。 */
-const createBottle = db.transaction((id, t, v) => {
+/** 登记原始瓶（事务）：可填写失效时间（可选）。提交后台账版本递增，已发放的批次凭据随之失效。 */
+const createBottle = db.transaction((id, t, v, expiresAt) => {
   if (qBottle.get(id)) throw new ApiError(409, 'BOTTLE_CONFLICT', `瓶编号 ${id} 已存在（编号冲突）`);
-  qInsBottle.run(id, 'original', t, v, null);
+  qInsBottle.run(id, 'original', t, v, null, expiresAt || null);
   qBumpVersion.run();
-  return { ok: true, message: `原始瓶 ${id} 已登记` };
+  return { ok: true, message: `原始瓶 ${id} 已登记` + (expiresAt ? `（失效时间 ${expiresAt}）` : '') };
 });
 
 app.post('/api/bottles', wrap((req, res) => {
   const id = normId(req.body.bottle_id, '瓶编号');
   const t = normTime(req.body.sample_time, '采样时间');
   const v = normVolume(req.body.initial_volume, '初始体积');
-  res.status(201).json(createBottle(id, t, v));
+  const rawExp = req.body.expires_at;
+  const exp = (rawExp === undefined || rawExp === null || String(rawExp).trim() === '')
+    ? null
+    : normTime(rawExp, '失效时间');
+  res.status(201).json(createBottle(id, t, v, exp));
 }));
 
 app.post('/api/operations', wrap((req, res) => {
@@ -1691,16 +1856,21 @@ app.get('/api/bottles', wrap((req, res) => {
   const { balances } = recompute();
   const impact = quarantineImpactMap();
   const quarMap = new Map(qQuarAll.all().map((q) => [q.bottle_id, q]));
-  const reserved = activeReservedByBottle(nowLocal());
+  const now = nowLocal();
+  const reserved = activeReservedByBottle(now);
+  const expMap = expiryMap();
   const rows = db.prepare('SELECT * FROM bottles ORDER BY created_time, id').all()
     .map((b) => {
       const remaining = balances.get(b.id) ?? 0;
       const locked = reserved.get(b.id) ?? 0;
+      const exp = expMap.get(b.id) ?? null; // 有效失效时间（衍生瓶按来源链继承最早者）
       return {
         ...b,
         remaining,
         reserved: locked,              // 有效预约锁定量（未到期、未取消、未核销）
         reservable: remaining - locked, // 可预约量 = 当前余量 − 全部有效预约
+        expires_at: exp,                // 失效时间（未设置为 null）
+        expired: exp !== null && exp <= now, // 当前时间到达失效时间即已失效
         quarantine: quarMap.has(b.id)
           ? { reason: quarMap.get(b.id).reason, updated_at: quarMap.get(b.id).updated_at }
           : null,
@@ -1720,11 +1890,14 @@ app.get('/api/bottles/:id', wrap((req, res) => {
   const now = nowLocal();
   const remaining = balances.get(b.id) ?? 0;
   const locked = activeReservedByBottle(now).get(b.id) ?? 0;
+  const exp = expiryMap().get(b.id) ?? null; // 有效失效时间（衍生瓶按来源链继承最早者）
   res.json({
     ...b,
     remaining,
     reserved: locked,
     reservable: remaining - locked,
+    expires_at: exp,
+    expired: exp !== null && exp <= now,
     active_reservations: qResActiveOnBottle.all(b.id, now), // 当前有效预约（锁定该瓶的预约号、到期时间、锁定量）
     quarantine: quar ? { reason: quar.reason, updated_at: quar.updated_at } : null,
     affected: impact.has(b.id),
@@ -1763,6 +1936,29 @@ app.put('/api/bottles/:id/quarantine', wrap((req, res) => {
 /** 解除原瓶隔离：未隔离 → 409 NOT_QUARANTINED；解除后台账版本递增。 */
 app.delete('/api/bottles/:id/quarantine', wrap((req, res) => {
   res.json(liftQuarantine(normId(req.params.id, '瓶编号')));
+}));
+
+// ---------------------------------------------------------------- 样本有效期 HTTP 接口
+
+/**
+ * 设置 / 修改原瓶失效时间：{expires_at}（YYYY-MM-DDTHH:MM）。仅已登记原始瓶；
+ * 衍生瓶的失效时间按全部来源瓶中最早者自动继承，不可直接设置（400 NOT_ORIGINAL）。
+ * 新设 → 201；修改为不同时间 → 200；相同时间重复设置 → 200 幂等返回（台账版本不变）。
+ * 状态变动使台账版本递增，未使用的批次提交凭据与更正确认凭据随之失效（需重新预演）。
+ */
+app.put('/api/bottles/:id/expiry', wrap((req, res) => {
+  const id = normId(req.params.id, '瓶编号');
+  const exp = normTime(req.body && req.body.expires_at, '失效时间');
+  const result = setExpiry(id, exp);
+  res.status(result.idempotent || result.updated ? 200 : 201).json(result);
+}));
+
+/**
+ * 清除原瓶失效时间 → 200；未设置 → 409 NO_EXPIRY；衍生瓶 → 400 NOT_ORIGINAL；
+ * 瓶不存在 → 404。清除后台账版本递增，未使用凭据失效。
+ */
+app.delete('/api/bottles/:id/expiry', wrap((req, res) => {
+  res.json(clearExpiry(normId(req.params.id, '瓶编号')));
 }));
 
 /** 当前全部隔离原瓶及原因。 */
@@ -2047,17 +2243,17 @@ app.get('/api/batches/:batchId', wrap((req, res) => {
 function seed() {
   if (db.prepare('SELECT COUNT(*) AS c FROM bottles').get().c > 0) return;
   db.transaction(() => {
-    qInsBottle.run('W2026-001', 'original', '2026-09-30T08:00:00', 1000, null);
-    qInsBottle.run('W2026-002', 'original', '2026-09-30T09:00:00', 800, null);
-    qInsBottle.run('W2026-003', 'original', '2026-10-01T08:30:00', 500, null);
+    qInsBottle.run('W2026-001', 'original', '2026-09-30T08:00:00', 1000, null, null);
+    qInsBottle.run('W2026-002', 'original', '2026-09-30T09:00:00', 800, null, null);
+    qInsBottle.run('W2026-003', 'original', '2026-10-01T08:30:00', 500, null, null);
 
     qInsOp.run('OP-0001', 1, 'MIX-001', '2026-10-01T10:00:00', null);
-    qInsBottle.run('MIX-001', 'derived', '2026-10-01T10:00:00', 0, 'OP-0001');
+    qInsBottle.run('MIX-001', 'derived', '2026-10-01T10:00:00', 0, 'OP-0001', null);
     qInsSource.run('OP-0001', 'W2026-001', 200);
     qInsSource.run('OP-0001', 'W2026-002', 150);
 
     qInsOp.run('OP-0002', 2, 'ALQ-001', '2026-10-02T09:00:00', null);
-    qInsBottle.run('ALQ-001', 'derived', '2026-10-02T09:00:00', 0, 'OP-0002');
+    qInsBottle.run('ALQ-001', 'derived', '2026-10-02T09:00:00', 0, 'OP-0002', null);
     qInsSource.run('OP-0002', 'MIX-001', 100);
 
     qBumpVersion.run();
