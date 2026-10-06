@@ -3,7 +3,7 @@
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
 原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、
 历史操作更正与**更正预演 / 确认两阶段**、**原瓶质检隔离与影响范围拦截**、
-**形成证据封存与复核比较**、**预约锁定与核销**。
+**形成证据封存与复核比较**、**预约锁定与核销**、**样本有效期管理（失效自动拦截）**。
 
 ## 一键启动（Docker Compose）
 
@@ -35,10 +35,11 @@ npm start          # 访问 http://localhost:3000
 
 ## 页面功能
 
-- **瓶子总览**：每个瓶的类型（原始瓶 / 衍生瓶）、创建或采样时间、初始体积、当前余量；
+- **瓶子总览**：每个瓶的类型（原始瓶 / 衍生瓶）、创建或采样时间、初始体积、当前余量、
+  **失效时间与失效状态（可按状态筛选）**；
   点击任意行查看该瓶的**完整来源谱系**（向上递归至原始瓶）、**各原始瓶的精确贡献量（分数 mL）**
-  及相关操作记录。
-- **登记原始瓶**：录入瓶编号、采样时间、初始体积（mL，正整数）。
+  及相关操作记录；原瓶详情中可直接**修改或清除失效时间**。
+- **登记原始瓶**：录入瓶编号、采样时间、初始体积（mL，正整数）与**失效时间（可选）**。
 - **新建分装 / 混样**：录入唯一操作号、目标瓶编号（须为新编号）、操作时间、
   一个或多个来源瓶及各自取用体积；目标瓶体积 = 取用量之和。
 - **批量预演 / 提交**：把连续分装 / 混样作为一个批次处理。录入批次号与按录入顺序排列的
@@ -419,6 +420,68 @@ curl -s -X POST http://localhost:3000/api/reservations/RSV-0003/cancel
 “瓶子总览”新增 预约锁定 / 可预约 两列，瓶详情展示有效预约明细；“新建分装 / 混样”与
 “批量预演 / 提交”的每条操作均可选填预约号（ datalist 自动列出当前有效预约）。
 
+## 样本有效期管理（本轮新增）
+
+实验室可为样本登记**失效时间**：登记原始瓶时可选填失效时间，已登记原瓶可随时**修改**或
+**清除**；衍生瓶不设独立失效时间，其**有效失效时间**按全部来源瓶（沿形成图递归至原瓶）中
+**最早**的失效时间实时计算，全部来源均无失效时间则不设。
+
+- **自动计算与重算**：有效失效时间基于当前已提交形成图实时计算，不落库。历史更正改变
+  来源关系后，目标瓶及全部下游瓶的有效失效时间随之重算；被守恒规则拒绝的更正已回滚，
+  形成图不变，结果自然不变。瓶详情中的 `expiry_from` 指出最早失效时间由哪些原瓶决定。
+- **失效判定**：当前时间（服务器本地时间）达到有效失效时间的瓶标记为**已失效**
+  （惰性实时判定，不写库）。失效瓶的下游瓶因“取全部来源最早失效时间”必然同样已失效，
+  即**失效瓶及由其形成的下游瓶**一并受限。
+- **拦截**：已失效的瓶不得用于**新分装 / 混样**（单条 `POST /api/operations` 与批次条目）、
+  **预约登记**（`POST /api/reservations`）或**预约核销**（携预约号的操作，来源即预约来源，
+  被同一规则拦截）。单条提交返回 409 `EXPIRED_SOURCE` 并在 details 中逐瓶给出有效失效时间；
+  **批次预演**在对应条目上给出同样错误（不签发提交凭据），批内前项生成的瓶沿失效链向后传播，
+  后项引用一并拦截；**批次提交**在事务内重跑全部校验，失败即整批回滚、不落库
+  （预演后失效时间到点的，提交时同样被拦截回滚）。
+- **凭据失效**：失效时间的设置 / 修改 / 清除使台账版本递增，**未使用的批次提交凭据与
+  更正确认凭据随之失效**（409 `STALE_TOKEN`，需重新预演）；相同值重复设置为幂等返回，
+  不变更台账版本。
+- **历史与幂等不受影响**：历史操作记录、更正（立即更正 / 预演 / 确认）、证据封存与全部
+  查询照常可用，不因失效拦截；**已成功请求的幂等重试保持原结果**（批次同内容重试 200 幂等、
+  更正确认同凭据重试返回首次结果、单条操作与预约同内容重试幂等），即使来源瓶此后已失效。
+- **幂等**：原瓶以相同失效时间重复设置 → 200 幂等返回，不变更台账版本；
+  以不同时间设置 → 200 更新；未设置过失效时间的原瓶执行清除 → 409 `EXPIRY_NOT_SET`。
+
+### 调用示例
+
+```bash
+# 1) 登记带失效时间的原瓶（expires_at 可选，格式同操作时间）→ 201
+curl -s http://localhost:3000/api/bottles -H 'Content-Type: application/json' -d '{
+  "bottle_id": "W2026-004", "sample_time": "2026-10-05T08:00",
+  "initial_volume": 500, "expires_at": "2026-10-20T00:00"}'
+
+# 2) 修改 / 清除已登记原瓶的失效时间（仅原瓶；相同值重复设置 → 200 幂等）
+curl -s -X PUT http://localhost:3000/api/bottles/W2026-004/expiry \
+  -H 'Content-Type: application/json' -d '{"expires_at":"2026-10-25T00:00"}'
+# → 200 {"ok":true,"updated":true,"previous_expires_at":"2026-10-20T00:00:00", ...}
+curl -s -X DELETE http://localhost:3000/api/bottles/W2026-004/expiry
+# → 200 {"ok":true,"expires_at":null, ...}；未设置过时清除 → 409 EXPIRY_NOT_SET
+
+# 3) 查看有效失效时间与状态（衍生瓶自动继承来源链最早值）
+curl -s http://localhost:3000/api/bottles/ALQ-001
+# → {"expires_at":null,"effective_expires_at":"2026-10-20T00:00:00",
+#    "expired":false,"expiry_status":"valid","expiry_from":["W2026-004"], ...}
+#    expiry_status：unset（未设置）/ valid（有效）/ expired（已失效）
+
+# 4) 失效瓶用于新分装 / 混样 / 预约登记 / 预约核销被拦截
+curl -s -X POST http://localhost:3000/api/operations -H 'Content-Type: application/json' -d '{
+  "op_id":"OP-0401","target_bottle":"ALQ-401","op_time":"2026-10-21T09:00",
+  "sources":[{"bottle":"W2026-004","volume":50}]}'
+# → 409 {"error":{"code":"EXPIRED_SOURCE","message":"以下来源瓶已失效……",
+#        "details":[{"bottle":"W2026-004","effective_expires_at":"2026-10-20T00:00:00"}]}}
+```
+
+瓶子总览（`GET /api/bottles`）与瓶详情（`GET /api/bottles/:id`）响应追加
+`expires_at`（原瓶登记值）、`effective_expires_at`（有效失效时间，衍生瓶为来源链最早值）、
+`expired`、`expiry_status`（`unset` / `valid` / `expired`）字段，瓶详情另附 `expiry_from`
+（决定最早失效时间的原瓶）。工作台“瓶子总览”新增**失效时间 / 失效状态**两列并可按状态筛选，
+“登记原始瓶”页可选填失效时间，原瓶详情中可直接修改或清除失效时间。
+
 ## 业务规则与一致性设计
 
 - **唯一操作号 + 幂等**：`op_id` 为主键。同一操作号重复提交**相同内容**时幂等返回
@@ -459,6 +522,15 @@ curl -s -X POST http://localhost:3000/api/reservations/RSV-0003/cancel
   更正确认凭据绑定预约指纹（有效预约集合哈希），预约新增 / 取消 / 核销 / 到期均使
   未提交凭据失效；幂等判定（批次号 + 计划哈希、确认凭据哈希、操作号 + 内容、
   预约号 + 内容哈希）先于凭据校验，已成功请求的重试不受指纹变化影响。
+- **样本有效期**：失效时间存于 `bottles.expires_at`（仅原瓶可登记 / 修改 / 清除）。
+  有效失效时间 = 原瓶登记值沿形成图向衍生瓶传播（全部来源取最早值，无则不设），
+  查询 / 校验时实时计算，更正成功后自动重算。当前时间达到有效失效时间即已失效
+  （惰性判定）；失效瓶及其下游瓶不得用于新分装 / 混样、预约登记或预约核销，
+  单条提交、批次预演（逐条报错、批内沿失效链传播）与批次提交（事务内重跑校验、
+  整批回滚）共用同一拦截逻辑；更正与证据封存不受拦截。失效时间变动递增台账版本，
+  使未使用的批次提交 / 更正确认凭据失效；幂等判定（批次号 + 计划哈希、确认凭据哈希、
+  操作号 + 内容、预约号 + 内容哈希、原瓶 + 相同失效时间）先于校验，
+  已成功请求的重试保持原结果。
 - **并发守恒**：better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
   并发争用同一来源瓶时不会出现超扣；已用并发压测验证（10 并发争用 400 mL，
   恰好 4 笔成功、余量归零不为负；5 并发重复提交同一操作号仅扣量一次；
@@ -473,7 +545,9 @@ curl -s -X POST http://localhost:3000/api/reservations/RSV-0003/cancel
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/bottles` | 登记原始瓶 `{bottle_id, sample_time, initial_volume}` |
+| `POST` | `/api/bottles` | 登记原始瓶 `{bottle_id, sample_time, initial_volume, expires_at?}`（失效时间可选） |
+| `PUT` | `/api/bottles/:id/expiry` | **（新增）** 设置 / 修改原瓶失效时间 `{expires_at}`（仅原瓶）→ 201 / 修改 200 / 相同值 200 幂等；衍生瓶 400、瓶不存在 404；变动使台账版本递增 |
+| `DELETE` | `/api/bottles/:id/expiry` | **（新增）** 清除原瓶失效时间 → 200；未设置 409 `EXPIRY_NOT_SET`；清除后台账版本递增 |
 | `POST` | `/api/operations` | 新建操作 `{op_id, target_bottle, op_time, sources:[{bottle, volume}], reservation_id?}`；携预约号时来源用量须与预约逐项吻合，成功后原子核销 |
 | `POST` | `/api/operations/:op_id/correct` | 更正取用量 `{sources:[{bottle, volume}]}`；使有效预约超额则整体拒绝（409 `RESERVATION_EXCEEDED`） |
 | `POST` | `/api/operations/:op_id/corrections/preview` | 更正预演（不写库）`{sources}` → 余量变化 `balance_changes` + 目标瓶及下游瓶贡献前后对照 `contribution_changes` + 预约超额 `reservation_excess` + `confirm_token`；校验失败给出原因且不签发凭据 |
@@ -486,8 +560,8 @@ curl -s -X POST http://localhost:3000/api/reservations/RSV-0003/cancel
 | `GET`  | `/api/reservations` | **（新增）** 全部预约（状态实时判定：有效 / 已到期 / 已取消 / 已核销）；可按 `?bottle=` 过滤 |
 | `GET`  | `/api/reservations/:id` | **（新增）** 单个预约详情；不存在 404 `RESERVATION_NOT_FOUND` |
 | `POST` | `/api/reservations/:id/cancel` | **（新增）** 取消有效预约 → 200；重复取消 200 幂等；已核销 409 `RESERVATION_NOT_ACTIVE`；已到期 409 `RESERVATION_EXPIRED` |
-| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `reserved` 预约锁定量 / `reservable` 可预约量 / `quarantine` / `affected` / `quarantine_hits`） |
-| `GET` | `/api/bottles/:id` | 单瓶详情：余量、预约锁定与可预约量、有效预约 `active_reservations`、来源谱系、相关操作、原瓶精确贡献量 `contributions`、隔离状态与命中 |
+| `GET` | `/api/bottles` | 全部瓶及当前余量（含 `reserved` 预约锁定量 / `reservable` 可预约量 / `quarantine` / `affected` / `quarantine_hits` / `expires_at` / `effective_expires_at` / `expired` / `expiry_status`） |
+| `GET` | `/api/bottles/:id` | 单瓶详情：余量、预约锁定与可预约量、有效预约 `active_reservations`、来源谱系、相关操作、原瓶精确贡献量 `contributions`、隔离状态与命中、失效时间与状态（含 `expiry_from`） |
 | `PUT` | `/api/bottles/:id/quarantine` | **（新增）** 设置原瓶隔离 `{reason}`（非空；仅原瓶）→ 201 / 更新原因 200 / 相同原因 200 幂等；衍生瓶 400、瓶不存在 404 |
 | `DELETE` | `/api/bottles/:id/quarantine` | **（新增）** 解除原瓶隔离 → 200；未隔离 409 `NOT_QUARANTINED` |
 | `GET` | `/api/quarantines` | **（新增）** 当前全部隔离原瓶及原因、设置时间 |
@@ -507,6 +581,6 @@ curl -s -X POST http://localhost:3000/api/reservations/RSV-0003/cancel
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较 + 预约锁定与核销
-└── public/index.html     # 单页工作台（总览（含可预约量）/ 登记 / 操作 / 批量预演提交 / 预约管理 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认 + 原瓶隔离与影响范围拦截 + 证据封存与复核比较 + 预约锁定与核销 + 样本有效期管理
+└── public/index.html     # 单页工作台（总览（含可预约量、失效时间与状态筛选）/ 登记（可填失效时间）/ 操作 / 批量预演提交 / 预约管理 / 记录与更正（预演+确认）/ 贡献量展示 / 质检隔离 / 证据封存）
 ```

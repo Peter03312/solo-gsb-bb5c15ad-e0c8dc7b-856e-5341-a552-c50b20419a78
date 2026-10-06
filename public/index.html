@@ -41,6 +41,9 @@ label{font-size:13px;color:#44515d;display:block;margin:10px 0 4px}
 .tag.rsv-active{background:#e6f4ea;color:#1a7f37}
 .tag.rsv-inactive{background:#eceff1;color:#5f6b76}
 .tag.rsv-fulfilled{background:#e3f0fb;color:#0b6fa4}
+.tag.exp-valid{background:#e6f4ea;color:#1a7f37}
+.tag.exp-expired{background:#fdecea;color:#b3261e}
+.tag.exp-unset{background:#eceff1;color:#5f6b76}
 ul.tree{list-style:none;padding-left:18px;border-left:1px dashed #b9c6d0;margin:6px 0}
 ul.tree>li{margin:4px 0}
 .mono{font-family:ui-monospace,Consolas,monospace}
@@ -60,7 +63,7 @@ h4{margin:14px 0 6px;font-size:14px}
 <body>
 <header>
   <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
-  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较 / 预约锁定与核销</p>
+  <p>原瓶登记（可填失效时间）/ 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）/ 质检隔离与影响范围 / 证据封存与复核比较 / 预约锁定与核销 / 样本有效期（失效瓶及其下游瓶自动拦截）</p>
 </header>
 <nav>
   <button data-tab="bottles" class="active">瓶子总览</button>
@@ -78,12 +81,23 @@ h4{margin:14px 0 6px;font-size:14px}
 <!-- ============ 瓶子总览 ============ -->
 <section id="tab-bottles">
   <div class="card">
-    <h3>瓶子总览（当前余量 / 预约锁定 / 可预约量）</h3>
+    <h3>瓶子总览（当前余量 / 预约锁定 / 可预约量 / 失效时间）</h3>
+    <p style="margin:0 0 10px;display:flex;gap:8px;align-items:center">
+      <label for="expFilter" style="margin:0">按失效状态筛选：</label>
+      <select id="expFilter" style="padding:6px 8px;border:1px solid #c7d0d8;border-radius:6px;font-size:14px">
+        <option value="all">全部</option>
+        <option value="valid">有效（未失效）</option>
+        <option value="expired">已失效</option>
+        <option value="unset">未设置失效时间</option>
+      </select>
+    </p>
     <table id="bottleTable">
-      <thead><tr><th>瓶编号</th><th>类型</th><th>创建/采样时间</th><th class="num">初始体积 (mL)</th><th class="num">当前余量 (mL)</th><th class="num">预约锁定 (mL)</th><th class="num">可预约 (mL)</th><th>来源操作</th><th>隔离状态</th></tr></thead>
+      <thead><tr><th>瓶编号</th><th>类型</th><th>创建/采样时间</th><th class="num">初始体积 (mL)</th><th class="num">当前余量 (mL)</th><th class="num">预约锁定 (mL)</th><th class="num">可预约 (mL)</th><th>失效时间（有效）</th><th>失效状态</th><th>来源操作</th><th>隔离状态</th></tr></thead>
       <tbody></tbody>
     </table>
-    <p class="hint">可预约量 = 当前余量 − 全部有效预约（未到期、未取消、未核销）。点击任意行查看该瓶的完整来源谱系与相关操作。</p>
+    <p class="hint">可预约量 = 当前余量 − 全部有效预约（未到期、未取消、未核销）。失效时间：原瓶为登记值，
+      衍生瓶按全部来源瓶最早失效时间自动计算（标注“继承”）；当前时间达到失效时间即标记“已失效”，
+      失效瓶及其下游瓶不得用于新分装 / 混样、预约登记或预约核销。点击任意行查看该瓶的完整来源谱系与相关操作。</p>
   </div>
   <div class="card" id="bottleDetail" style="display:none"></div>
 </section>
@@ -96,8 +110,12 @@ h4{margin:14px 0 6px;font-size:14px}
       <div><label>瓶编号（唯一）</label><input id="reg_id" type="text" placeholder="如 W2026-004"></div>
       <div><label>采样时间</label><input id="reg_time" type="datetime-local" step="60"></div>
       <div><label>初始体积（mL，正整数）</label><input id="reg_vol" type="number" min="1" step="1" placeholder="如 500"></div>
+      <div><label>失效时间（可选；留空则不设）</label><input id="reg_expiry" type="datetime-local" step="60"></div>
     </div>
     <p><button class="btn" id="regSubmit">登记</button></p>
+    <p class="hint">失效时间登记后可在瓶详情中修改或清除；衍生瓶的失效时间按其全部来源瓶中最早值自动计算，
+      全部来源无失效时间则不设。当前时间达到失效时间的瓶标记为已失效，失效瓶及其下游瓶不得用于
+      新分装 / 混样、预约登记或预约核销。</p>
   </div>
 </section>
 
@@ -118,7 +136,8 @@ h4{margin:14px 0 6px;font-size:14px}
       <button class="btn" id="opSubmit">提交操作</button>
     </p>
     <p class="hint">目标瓶体积 = 各来源取用量之和；任一时刻任一来源瓶超用，整次操作将被拒绝。
-      未携预约的取用只能使用未锁定余量（当前余量 − 有效预约锁定量）。</p>
+      未携预约的取用只能使用未锁定余量（当前余量 − 有效预约锁定量）。
+      受隔离影响或已失效的瓶（含其下游瓶）不得用作来源。</p>
   </div>
 </section>
 
@@ -156,7 +175,7 @@ h4{margin:14px 0 6px;font-size:14px}
       <button class="btn secondary small" id="rsvAddRow">+ 添加来源行</button>
       <button class="btn" id="rsvSubmit">登记预约</button>
     </p>
-    <p class="hint">受隔离影响的瓶不得新预约；执行分装 / 混样（单条或批次条目）时携预约号、来源及用量逐项吻合，
+    <p class="hint">受隔离影响或已失效的瓶（含其下游瓶）不得新预约；执行分装 / 混样（单条或批次条目）时携预约号、来源及用量逐项吻合，
       成功后与取用原子核销；预演只校验不核销。预约变化或到期会使未提交的预演凭据失效（需重新预演）。</p>
   </div>
   <div class="card">
@@ -273,6 +292,9 @@ function showMsg(type, text, details) {
         return `来源瓶 ${c.bottle} 受隔离影响（命中隔离原瓶：` +
           c.hits.map(h => `${h.bottle}（${h.reason}）`).join('、') + '）';
       }
+      if (c && typeof c.bottle === 'string' && c.effective_expires_at) {
+        return `来源瓶 ${c.bottle} 已失效（有效失效时间 ${c.effective_expires_at}），失效瓶及其下游瓶不得使用`;
+      }
       if (c && typeof c.bottle === 'string' && c.reserved !== undefined) {
         const need = c.requested !== undefined ? `需取 ${c.requested} mL，` :
           (c.drawn !== undefined ? `批内未携预约取用合计 ${c.drawn} mL，` : '');
@@ -328,15 +350,54 @@ function hitsHtml(hits) {
   return hits.map(h => `<span class="mono">${escapeHtml(h.bottle)}</span>（${escapeHtml(h.reason)}）`).join('、');
 }
 
+// ---------- 失效状态展示 ----------
+function expiryCellHtml(b) {
+  if (!b.effective_expires_at) return '<span class="hint">未设置</span>';
+  const inh = b.kind === 'derived' ? ' <span class="hint">（继承）</span>' : '';
+  return `<span class="${b.expired ? 'low' : ''}">${escapeHtml(b.effective_expires_at)}</span>${inh}`;
+}
+function expiryStatusTag(b) {
+  if (b.expiry_status === 'expired') return '<span class="tag exp-expired">已失效</span>';
+  if (b.expiry_status === 'valid') return '<span class="tag exp-valid">有效</span>';
+  return '<span class="tag exp-unset">未设置</span>';
+}
+
 // ---------- 瓶子总览 ----------
+let bottleRowsCache = []; // 最近一次 /api/bottles 结果，状态筛选在客户端应用
+
 async function loadBottles() {
-  const rows = await api('/api/bottles');
-  const tb = document.querySelector('#bottleTable tbody');
-  tb.innerHTML = '';
+  bottleRowsCache = await api('/api/bottles');
+  renderBottleTable();
   const dl = $('bottleList');
   dl.innerHTML = '';
   const odl = $('originalBottleList');
   odl.innerHTML = '';
+  for (const b of bottleRowsCache) {
+    const opt = document.createElement('option');
+    opt.value = b.id;
+    opt.label = `余量 ${b.remaining} mL，可预约 ${b.reservable} mL` +
+      (b.expired ? `（已失效 ${b.effective_expires_at}）` : b.effective_expires_at ? `（失效 ${b.effective_expires_at}）` : '') +
+      (b.quarantine ? '（隔离中）' : b.affected ? '（受隔离影响）' : '');
+    dl.appendChild(opt);
+    if (b.kind === 'original') {
+      const oopt = document.createElement('option');
+      oopt.value = b.id;
+      oopt.label = (b.quarantine ? `隔离中：${b.quarantine.reason}` : `余量 ${b.remaining} mL`) +
+        (b.expires_at ? `，失效 ${b.expires_at}` : '');
+      odl.appendChild(oopt);
+    }
+  }
+}
+
+function renderBottleTable() {
+  const filter = $('expFilter').value;
+  const rows = bottleRowsCache.filter(b => filter === 'all' || b.expiry_status === filter);
+  const tb = document.querySelector('#bottleTable tbody');
+  tb.innerHTML = '';
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="11" class="hint">当前筛选条件下没有瓶子。</td></tr>';
+    return;
+  }
   for (const b of rows) {
     const tr = document.createElement('tr');
     tr.className = 'clickable';
@@ -348,22 +409,16 @@ async function loadBottles() {
       `<td class="num ${b.remaining === 0 ? 'low' : ''}">${b.remaining}</td>` +
       `<td class="num ${b.reserved > 0 ? '' : ''}">${b.reserved > 0 ? b.reserved : '—'}</td>` +
       `<td class="num ${b.reservable === 0 && b.remaining > 0 ? 'low' : ''}">${b.reservable}</td>` +
+      `<td>${expiryCellHtml(b)}</td>` +
+      `<td>${expiryStatusTag(b)}</td>` +
       `<td class="mono">${escapeHtml(b.created_op || '—')}</td>` +
       `<td>${quarTagHtml(b)}</td>`;
     tr.addEventListener('click', () => showBottle(b.id));
     tb.appendChild(tr);
-    const opt = document.createElement('option');
-    opt.value = b.id;
-    opt.label = `余量 ${b.remaining} mL，可预约 ${b.reservable} mL` + (b.quarantine ? '（隔离中）' : b.affected ? '（受隔离影响）' : '');
-    dl.appendChild(opt);
-    if (b.kind === 'original') {
-      const oopt = document.createElement('option');
-      oopt.value = b.id;
-      oopt.label = b.quarantine ? `隔离中：${b.quarantine.reason}` : `余量 ${b.remaining} mL`;
-      odl.appendChild(oopt);
-    }
   }
 }
+
+$('expFilter').addEventListener('change', renderBottleTable);
 
 async function showBottle(id) {
   try {
@@ -375,6 +430,21 @@ async function showBottle(id) {
       创建/采样时间：${escapeHtml(b.created_time)}
       ${b.kind === 'original' ? '初始体积：' + b.initial_volume + ' mL　' : ''}
       <b>当前余量：${b.remaining} mL</b>　预约锁定：${b.reserved} mL　<b>可预约：${b.reservable} mL</b></p>`;
+    // —— 失效时间与状态 ——
+    if (b.effective_expires_at) {
+      html += `<p>失效时间：<b class="${b.expired ? 'low' : ''}">${escapeHtml(b.effective_expires_at)}</b> ${expiryStatusTag(b)}` +
+        (b.kind === 'derived'
+          ? `<span class="hint">（继承自全部来源瓶最早失效时间${b.expiry_from && b.expiry_from.length
+              ? '，取决于原瓶 ' + b.expiry_from.map(x => `<span class="mono">${escapeHtml(x)}</span>`).join('、')
+              : ''}）</span>`
+          : '');
+      if (b.expired) {
+        html += `<br><span class="low">已失效：该瓶及由其形成的下游瓶不得用于新分装 / 混样、预约登记或预约核销。</span>`;
+      }
+      html += '</p>';
+    } else {
+      html += `<p>失效时间：<span class="hint">未设置${b.kind === 'derived' ? '（全部来源瓶均无失效时间）' : ''}</span> ${expiryStatusTag(b)}</p>`;
+    }
     if (b.active_reservations && b.active_reservations.length) {
       html += '<p>有效预约：' + b.active_reservations.map(r =>
         `<span class="tag rsv-active mono">${escapeHtml(r.reservation_id)}</span> 锁定 ${r.volume} mL（${escapeHtml(r.expires_at)} 到期）`).join('　') + '</p>';
@@ -385,6 +455,18 @@ async function showBottle(id) {
     }
     if (b.affected && b.quarantine_hits && b.quarantine_hits.length) {
       html += `<p class="low">受隔离影响，不得用于新分装 / 混样。命中隔离原瓶：${hitsHtml(b.quarantine_hits)}</p>`;
+    }
+    // —— 原瓶失效时间修改 / 清除 ——
+    if (b.kind === 'original') {
+      html += `<div style="margin:10px 0;padding:10px 12px;border:1px dashed var(--line);border-radius:6px">
+        <label style="margin-top:0">修改失效时间（原瓶；设置 / 修改 / 清除会使未使用的预演与确认凭据失效）</label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="expEdit" type="datetime-local" step="60" value="${b.expires_at ? escapeHtml(b.expires_at.slice(0, 16)) : ''}">
+          <button class="btn small" id="expSave">保存失效时间</button>
+          ${b.expires_at ? '<button class="btn secondary small" id="expClear">清除失效时间</button>' : ''}
+        </div>
+        <p class="hint">衍生瓶的失效时间按全部来源瓶最早值自动计算，随历史更正重算，不能直接设置。</p>
+      </div>`;
     }
     html += `<h4>来源谱系（向上追溯至原始瓶）</h4>${renderLineage(b.lineage)}
       <h4>原瓶贡献量（精确分数 mL；形成时总体积 ${b.contributions.formation_volume} mL）</h4>
@@ -400,6 +482,41 @@ async function showBottle(id) {
     }
     if (!b.operations.as_target.length && !b.operations.as_source.length) html += '<p>暂无相关操作。</p>';
     el.innerHTML = html;
+    // —— 原瓶失效时间编辑事件 ——
+    const saveBtn = document.getElementById('expSave');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async () => {
+        clearMsg();
+        const v = document.getElementById('expEdit').value;
+        if (!v) { showMsg('err', '请先选择失效时间；如需不设失效时间请使用“清除失效时间”'); return; }
+        saveBtn.disabled = true;
+        try {
+          const r = await api('/api/bottles/' + encodeURIComponent(id) + '/expiry', 'PUT', { expires_at: v });
+          showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+          showBottle(id); loadBottles();
+        } catch (e) {
+          showMsg('err', e.message, e.details);
+        } finally {
+          saveBtn.disabled = false;
+        }
+      });
+    }
+    const clearBtn = document.getElementById('expClear');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', async () => {
+        clearMsg();
+        clearBtn.disabled = true;
+        try {
+          const r = await api('/api/bottles/' + encodeURIComponent(id) + '/expiry', 'DELETE');
+          showMsg('ok', r.message);
+          showBottle(id); loadBottles();
+        } catch (e) {
+          showMsg('err', e.message, e.details);
+        } finally {
+          clearBtn.disabled = false;
+        }
+      });
+    }
   } catch (e) {
     showMsg('err', e.message, e.details);
   }
@@ -445,9 +562,10 @@ $('regSubmit').addEventListener('click', async () => {
       bottle_id: $('reg_id').value,
       sample_time: $('reg_time').value,
       initial_volume: $('reg_vol').value,
+      expires_at: $('reg_expiry').value || null,
     });
     showMsg('ok', r.message);
-    $('reg_id').value = ''; $('reg_vol').value = '';
+    $('reg_id').value = ''; $('reg_vol').value = ''; $('reg_expiry').value = '';
     loadBottles();
   } catch (e) {
     showMsg('err', e.message, e.details);
